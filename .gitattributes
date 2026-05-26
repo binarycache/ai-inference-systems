@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+*.ipynb text eol=lf
+*.lock text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
