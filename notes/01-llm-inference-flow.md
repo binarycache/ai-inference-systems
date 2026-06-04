@@ -59,3 +59,7 @@ For **VLM inference**, the same text-generation loop is still used: `generation/
 
 
 model.generate calls _sample() from GenerationMixin class which has two stages one prefill and Decode , prefill stage differs for LLM and VLM mainly due to preprocessing and Decode stage is identical including KV cache . 
+
+
+By default Dynamic Cache is used in Hugging face transformers which does torch.cat operation on previous KV cache and new token KV which in turn allocates new memory and copies contents there this causes peak memory to be much higher . Same problem arises in Beam search . 
+
