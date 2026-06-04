@@ -63,3 +63,35 @@ model.generate calls _sample() from GenerationMixin class which has two stages o
 
 By default Dynamic Cache is used in Hugging face transformers which does torch.cat operation on previous KV cache and new token KV which in turn allocates new memory and copies contents there this causes peak memory to be much higher . Same problem arises in Beam search . 
 
+General **Vision-Language Model inference flow** looks like this:
+
+1. **User provides image + text prompt**, for example: “Describe this image.”
+
+2. The **processor/chat template** converts the conversation into model inputs.
+
+3. The text part becomes `input_ids`, containing normal text tokens and special image placeholder tokens.
+
+4. The image itself does **not** become `input_ids`.
+
+5. The actual image is resized, normalized, and stored separately as `pixel_values`.
+
+6. Extra metadata like `image_grid_thw` tells the model how many visual patches/tokens the image corresponds to.
+
+7. `mm_token_type_ids` or similar masks mark which positions in `input_ids` are image placeholders and which are text tokens.
+
+8. During the model forward pass, text token IDs are converted into normal text embeddings.
+
+9. Separately, `pixel_values` are passed through the vision encoder.
+
+10. The vision encoder converts the image into visual patch features.
+
+11. These visual features are passed through a projector/adapter to match the LLM hidden size.
+
+12. The projected visual embeddings are inserted into the positions of the image placeholder tokens.
+
+13. Now the model has one combined embedding sequence: text embeddings + image embeddings + text embeddings.
+
+14. The transformer runs prefill on this full sequence and builds a KV cache containing both text and image context.
+
+15. Then decoding happens like a normal LLM: the model generates output tokens one by one while attending to the cached text and image information.
+
