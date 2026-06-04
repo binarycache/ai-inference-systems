@@ -95,3 +95,24 @@ General **Vision-Language Model inference flow** looks like this:
 
 15. Then decoding happens like a normal LLM: the model generates output tokens one by one while attending to the cached text and image information.
 
+## General LLM Inference Flow:
+
+1. User provides a text prompt.
+
+2. The tokenizer converts the prompt into `input_ids`.
+
+3. Special tokens, such as system/user/assistant tokens, may be added by the chat template.
+
+4. An `attention_mask` is created to mark valid tokens and ignore padding.
+
+5. The model converts each token ID into a text embedding.
+
+6. Positional information is applied so the model understands token order.
+
+7. The full prompt is passed through transformer layers in the **prefill stage**.
+
+8. During prefill, the model creates a **KV cache** for all prompt tokens.
+
+9. The model predicts logits for the next token, and a decoding strategy selects one token.
+
+10. The selected token is appended, and the model keeps generating one token at a time using the KV cache until it stops.
