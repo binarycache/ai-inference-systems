@@ -63,7 +63,7 @@ model.generate calls _sample() from GenerationMixin class which has two stages o
 
 By default Dynamic Cache is used in Hugging face transformers which does torch.cat operation on previous KV cache and new token KV which in turn allocates new memory and copies contents there this causes peak memory to be much higher . Same problem arises in Beam search . 
 
-General **Vision-Language Model inference flow** looks like this:
+## General VLM Inference Flow :
 
 1. **User provides image + text prompt**, for example: “Describe this image.”
 
