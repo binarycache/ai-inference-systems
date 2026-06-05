@@ -22,3 +22,5 @@ models/
 *.pth
 *.onnx
 experiments/week-01/notebooks/transformers/
+experiments/week-01/notebooks/Qwen3-0.6B-local/
+experiments/week-01/notebooks/Qwen3-VL-2B-Instruct-local/
