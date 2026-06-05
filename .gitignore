@@ -21,3 +21,4 @@ models/
 *.pt
 *.pth
 *.onnx
+experiments/week-01/notebooks/transformers/
