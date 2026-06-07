@@ -1,0 +1,316 @@
+The fastest way to deepen your intuition is to turn the notebook into an **LLM/VLM inference microscope**: fewer abstractions, more shape prints, timings, memory formulas, and controlled experiments.
+
+## 1. Add a “prefill vs decode” timing section
+
+Right now your notebook already descends from `.generate()` into manual token-by-token inference. The next improvement is to explicitly split generation into:
+
+**Prefill**
+Process the whole prompt in one forward pass. This creates the first logits and fills the KV cache.
+
+**Decode**
+Feed one new token at a time, reusing cached keys and values from all previous tokens.
+
+For each run, log:
+
+| Metric                      | Meaning                               |
+| --------------------------- | ------------------------------------- |
+| prompt tokens               | input length                          |
+| generated tokens            | output length                         |
+| prefill time                | time for first full-context forward   |
+| time to first token, TTFT   | user-visible first-token latency      |
+| decode time per token, TPOT | steady generation speed               |
+| KV cache memory             | memory consumed by cached K/V tensors |
+| tokens/sec                  | throughput                            |
+
+Hugging Face’s cache docs describe the key idea directly: autoregressive models otherwise recompute attention information for previous tokens repeatedly, while a KV cache stores it for reuse during generation. ([Hugging Face][1])
+
+A useful exercise:
+
+```python
+# Pseudocode structure
+with torch.no_grad():
+    # 1. Prefill
+    t0 = time.perf_counter()
+    out = model(input_ids=prompt_ids, use_cache=True)
+    prefill_time = time.perf_counter() - t0
+    past = out.past_key_values
+
+    # 2. Decode
+    next_id = out.logits[:, -1].argmax(dim=-1, keepdim=True)
+
+    for step in range(max_new_tokens):
+        t0 = time.perf_counter()
+        out = model(input_ids=next_id, past_key_values=past, use_cache=True)
+        decode_step_time = time.perf_counter() - t0
+        past = out.past_key_values
+        next_id = out.logits[:, -1].argmax(dim=-1, keepdim=True)
+```
+
+Then repeat with `use_cache=False` and compare. That one experiment usually makes KV cache intuition click.
+
+## 2. Print the KV cache shapes at every layer
+
+For a decoder-only model, each layer stores something like:
+
+```text
+key:   [batch, kv_heads, sequence_length, head_dim]
+value: [batch, kv_heads, sequence_length, head_dim]
+```
+
+Print this after prefill and after each decode step. Watch only the `sequence_length` dimension grow.
+
+Add a helper:
+
+```python
+def inspect_past_key_values(past_key_values, max_layers=3):
+    for layer_idx, layer_cache in enumerate(past_key_values[:max_layers]):
+        k, v = layer_cache[:2]
+        print(
+            f"Layer {layer_idx}: "
+            f"K={tuple(k.shape)}, V={tuple(v.shape)}, "
+            f"dtype={k.dtype}, device={k.device}"
+        )
+```
+
+Run it after prefill:
+
+```python
+inspect_past_key_values(out.past_key_values)
+```
+
+Then after each decode token. The important intuition is this:
+
+**Prefill computes K/V for all prompt tokens. Decode appends K/V for one new token at a time.**
+
+## 3. Add a KV memory calculator
+
+KV cache memory is often the real bottleneck in serving. Add this formula to your notebook:
+
+```python
+def estimate_kv_cache_bytes(
+    num_layers,
+    batch_size,
+    seq_len,
+    num_kv_heads,
+    head_dim,
+    dtype_bytes=2,  # fp16/bf16
+):
+    # 2 because key + value
+    return 2 * num_layers * batch_size * seq_len * num_kv_heads * head_dim * dtype_bytes
+```
+
+Then compare memory for:
+
+```text
+seq_len = 512, 2048, 8192, 32768
+batch_size = 1, 4, 16, 64
+```
+
+This will connect directly to why systems like vLLM focus so much on KV cache management. The PagedAttention paper says serving systems struggle because KV cache memory is large, grows and shrinks dynamically, and can be wasted through fragmentation or redundant duplication. ([arXiv][2])
+
+## 4. Build a tiny attention layer with and without cache
+
+Before studying optimized inference engines, implement one tiny single-head attention block manually.
+
+Do two versions:
+
+```text
+Version A: recompute K,V for full sequence every step
+Version B: compute K,V only for the new token and concatenate with cache
+```
+
+Use a toy sequence length like 5. Print the matrices. This removes the magic from `past_key_values`.
+
+The key thing to observe:
+
+```text
+Without cache:
+step 1 attends over 1 token
+step 2 recomputes attention over 2 tokens
+step 3 recomputes attention over 3 tokens
+...
+
+With cache:
+step 1 stores K,V for token 1
+step 2 only computes K,V for token 2, then attends over cached K,V
+step 3 only computes K,V for token 3, then attends over cached K,V
+...
+```
+
+This exercise is more valuable than reading five blog posts.
+
+## 5. For VLMs, inspect image tokens as part of prefill
+
+Your VLM section is a great place to build intuition. In many VLM inference flows, the image is processed into visual embeddings or image tokens, then those become part of the model’s input context. That means the image mostly increases **prefill cost**, not decode cost.
+
+Add experiments where you vary:
+
+| Experiment                | Expected effect                         |
+| ------------------------- | --------------------------------------- |
+| smaller image             | fewer visual tokens, lower prefill time |
+| larger image              | more visual tokens, higher prefill time |
+| same image, longer answer | decode cost increases                   |
+| multiple images           | prefill cost and KV memory increase     |
+
+For Qwen-style VLM inputs, inspect things like:
+
+```python
+print(inputs.keys())
+print(inputs["input_ids"].shape)
+print(inputs.get("pixel_values", None).shape if "pixel_values" in inputs else None)
+print(inputs.get("image_grid_thw", None))
+```
+
+Then measure TTFT and TPOT separately. The mental model should become:
+
+```text
+More image/detail/context → heavier prefill
+Longer answer → heavier decode
+Longer total sequence → larger KV cache
+```
+
+## 6. Reproduce three optimization ideas yourself
+
+After KV cache and prefill/decode are clear, implement small toy versions of these.
+
+### A. Prefix caching
+
+Run two prompts:
+
+```text
+Prompt 1: "You are a helpful AI inference tutor. Explain KV cache..."
+Prompt 2: "You are a helpful AI inference tutor. Explain prefill..."
+```
+
+The prefix is shared. Conceptually, prefix caching means you reuse the KV cache for the common prefix instead of recomputing it.
+
+vLLM lists prefix caching, chunked prefill, continuous batching, and PagedAttention among its serving optimizations. ([GitHub][3])
+
+### B. Chunked prefill
+
+Instead of pre-filling a 16k-token prompt in one huge forward pass, split it into chunks.
+
+Conceptually:
+
+```text
+chunk 1 → update KV cache
+chunk 2 → update KV cache
+chunk 3 → update KV cache
+...
+decode starts after full prompt is consumed
+```
+
+vLLM’s docs describe chunked prefill as a way to process large prefills in smaller chunks and batch them with decode requests, balancing compute-bound prefill work with memory-bound decode work. ([vLLM][4])
+
+### C. Continuous batching
+
+Simulate multiple users:
+
+```text
+Request A: already decoding
+Request B: just arrived, needs prefill
+Request C: short prompt, short decode
+Request D: long prompt, long decode
+```
+
+A naive server waits for the whole batch to finish. A continuous batching server inserts and removes requests dynamically. NVIDIA TensorRT-LLM describes in-flight batching, also called continuous or iteration-level batching, as a technique where context-phase and generation-phase sequences can be processed together to improve GPU use and reduce latency. ([NVIDIA GitHub][5])
+
+You do not need to build a production scheduler. A toy Python scheduler that logs which request is in `prefill`, `decode`, or `finished` at each step is enough.
+
+## 7. Study optimizations in this order
+
+This order will preserve intuition:
+
+1. **Manual autoregressive generation**
+   Understand logits, sampling, stopping, and the one-token-at-a-time loop.
+
+2. **KV cache**
+   Understand what gets stored, where sequence length grows, and why memory scales with context.
+
+3. **Prefill vs decode**
+   Understand why prefill is usually more compute-heavy and decode is often more memory-bandwidth sensitive.
+
+4. **FlashAttention**
+   Learn why attention speed is not just FLOPs, but memory movement. FlashAttention reduces HBM memory reads and writes by using tiling between GPU high-bandwidth memory and on-chip SRAM. ([arXiv][6])
+
+5. **PagedAttention**
+   Learn why serving many requests is a memory-management problem, not only a model-computation problem. PagedAttention adapts virtual-memory-style paging ideas to KV cache allocation. ([arXiv][2])
+
+6. **Continuous batching and chunked prefill**
+   Learn how serving systems keep GPUs busy when requests have different prompt and generation lengths. ([NVIDIA GitHub][5])
+
+7. **Speculative decoding**
+   Learn how a smaller or cheaper drafter proposes multiple tokens, then the target model verifies them in parallel. A 2024 survey describes speculative decoding as using a draft model to generate candidate future tokens and then verifying them in parallel to reduce autoregressive latency. ([arXiv][7])
+
+## 8. A concrete next notebook structure
+
+I would extend your notebook like this:
+
+```text
+01_tokenization_and_prompt_layout.ipynb
+- chat template
+- special tokens
+- input_ids
+- VLM image placeholders
+
+02_prefill_decode_kv_cache.ipynb
+- manual prefill
+- manual decode
+- print cache shapes
+- cache on/off benchmark
+
+03_kv_memory_math.ipynb
+- KV memory calculator
+- batch size vs context length
+- MHA vs MQA vs GQA comparison
+
+04_attention_kernels.ipynb
+- naive attention
+- PyTorch scaled_dot_product_attention
+- FlashAttention if available
+- timing and memory comparison
+
+05_serving_simulator.ipynb
+- static batching
+- continuous batching
+- chunked prefill
+- prefix caching
+
+06_vlm_inference_costs.ipynb
+- image resolution vs visual tokens
+- image-heavy prefill
+- text-heavy decode
+- multi-image prompts
+
+07_real_engine_comparison.ipynb
+- Transformers generate
+- vLLM
+- TensorRT-LLM if you have NVIDIA setup
+- compare TTFT, TPOT, throughput, memory
+```
+
+## My strongest recommendation
+
+Do **not** jump directly into vLLM internals yet. First, make your own tiny traces:
+
+```text
+token id
+position id
+attention mask
+K shape
+V shape
+prefill time
+decode step time
+GPU memory
+generated token
+```
+
+Once you can look at a trace and say, “this request is prefill-bound” or “this request is decode-bound because KV reads dominate,” the production optimizations will feel obvious rather than mysterious.
+
+[1]: https://huggingface.co/docs/transformers/kv_cache?utm_source=chatgpt.com "Cache strategies · Hugging Face"
+[2]: https://arxiv.org/abs/2309.06180?utm_source=chatgpt.com "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+[3]: https://github.com/vllm-project/vllm?utm_source=chatgpt.com "GitHub - vllm-project/vllm: A high-throughput and memory-efficient ..."
+[4]: https://docs.vllm.ai/en/stable/configuration/optimization/?utm_source=chatgpt.com "Optimization and Tuning - vLLM"
+[5]: https://nvidia.github.io/TensorRT-LLM/features/paged-attention-ifb-scheduler.html?utm_source=chatgpt.com "Paged Attention, IFB, and Request Scheduling — TensorRT LLM"
+[6]: https://arxiv.org/abs/2205.14135?utm_source=chatgpt.com "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+[7]: https://arxiv.org/abs/2401.07851?utm_source=chatgpt.com "Unlocking Efficiency in Large Language Model Inference: A Comprehensive Survey of Speculative Decoding"
